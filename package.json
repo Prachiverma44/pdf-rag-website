@@ -1,0 +1,21 @@
+{
+  "name": "pdf-rag-website",
+  "version": "1.0.0",
+  "description": "PDF specific RAG website using Gemini embeddings and Pinecone namespaces.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.42.0",
+    "@pinecone-database/pinecone": "^5.1.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "iconv-lite": "^0.4.24",
+    "multer": "^1.4.5-lts.1",
+    "nanoid": "^5.0.7",
+    "pdf-parse": "^1.1.1"
+  }
+}
