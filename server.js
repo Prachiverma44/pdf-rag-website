@@ -15,7 +15,10 @@ const uploadsDir = process.env.VERCEL ? '/tmp/pdf-rag-uploads' : path.join(__dir
 
 await mkdir(uploadsDir, { recursive: true });
 
-const requiredEnv = ['GEMINI_API_KEY', 'PINECONE_API_KEY', 'PINECONE_INDEX_NAME'];
+// Only Pinecone stays server-owned (single shared index, isolated by
+// namespace/documentId). Gemini can now come from the user's own key
+// (BYOK) so a public deployment doesn't burn one shared free-tier quota.
+const requiredEnv = ['PINECONE_API_KEY', 'PINECONE_INDEX_NAME'];
 for (const key of requiredEnv) {
   if (!process.env[key]) {
     console.warn(`Missing ${key}. Add it in pdf-rag-website/.env before running the app.`);
@@ -40,11 +43,9 @@ const upload = multer({
 const embeddingModel = process.env.GEMINI_EMBEDDING_MODEL || 'gemini-embedding-001';
 const chatModel = process.env.GEMINI_CHAT_MODEL || 'gemini-2.5-flash';
 
-let ai;
 let pineconeIndex;
 
 if (hasRequiredEnv()) {
-  ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
   const pinecone = new Pinecone({
     apiKey: process.env.PINECONE_API_KEY
   });
@@ -70,20 +71,37 @@ function hasRequiredEnv() {
   return requiredEnv.every((key) => Boolean(process.env[key]));
 }
 
-function ensureConfigured(res) {
+// Builds a Gemini client from the caller's own API key (BYOK). Falls back
+// to the server's GEMINI_API_KEY (if one is set in .env) so local/dev use
+// still works without every developer needing to paste a key.
+function getAiClient(userProvidedKey) {
+  const apiKey = (userProvidedKey && userProvidedKey.trim()) || process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  return new GoogleGenAI({ apiKey });
+}
+
+function ensureConfigured(res, ai) {
   if (ai && pineconeIndex) return true;
 
+  if (!ai) {
+    res.status(400).json({
+      error: 'A Gemini API key is required. Please enter your key in the sidebar.'
+    });
+    return false;
+  }
+
   res.status(500).json({
-    error: 'Server is missing GEMINI_API_KEY, PINECONE_API_KEY, or PINECONE_INDEX_NAME in .env.'
+    error: 'Server is missing PINECONE_API_KEY or PINECONE_INDEX_NAME in .env.'
   });
   return false;
 }
 
 app.post('/api/upload', upload.single('pdf'), async (req, res, next) => {
-  const { userId } = req.body;
+  const { userId, geminiApiKey } = req.body;
   const file = req.file;
+  const ai = getAiClient(geminiApiKey);
 
-  if (!ensureConfigured(res)) {
+  if (!ensureConfigured(res, ai)) {
     await cleanupFile(file?.path);
     return;
   }
@@ -115,22 +133,32 @@ app.post('/api/upload', upload.single('pdf'), async (req, res, next) => {
       return;
     }
 
+    const BATCH_SIZE = 5;
     const records = [];
-    for (let index = 0; index < chunks.length; index++) {
-      const text = chunks[index];
-      const values = await embedText(text);
-      records.push({
-        id: `${documentId}-${index}`,
-        values,
-        metadata: {
-          userId,
-          documentId,
-          fileName: originalName,
-          chunkIndex: index,
-          text,
-          uploadedAt: new Date().toISOString()
-        }
+
+    for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+      const batch = chunks.slice(i, i + BATCH_SIZE);
+      const batchValues = await Promise.all(batch.map((text) => embedText(ai, text)));
+
+      batchValues.forEach((values, batchIndex) => {
+        const index = i + batchIndex;
+        records.push({
+          id: `${documentId}-${index}`,
+          values,
+          metadata: {
+            userId,
+            documentId,
+            fileName: originalName,
+            chunkIndex: index,
+            text: batch[batchIndex],
+            uploadedAt: new Date().toISOString()
+          }
+        });
       });
+
+      if (i + BATCH_SIZE < chunks.length) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
     }
 
     const namespaceIndex = getUserScopedIndex(userId);
@@ -153,9 +181,10 @@ app.post('/api/upload', upload.single('pdf'), async (req, res, next) => {
 });
 
 app.post('/api/ask', async (req, res, next) => {
-  if (!ensureConfigured(res)) return;
+  const { userId, documentId, question, history = [], geminiApiKey } = req.body;
+  const ai = getAiClient(geminiApiKey);
 
-  const { userId, documentId, question } = req.body;
+  if (!ensureConfigured(res, ai)) return;
 
   if (!validateUserId(userId) || !documentId || !question?.trim()) {
     res.status(400).json({ error: 'userId, documentId, and question are required.' });
@@ -163,7 +192,9 @@ app.post('/api/ask', async (req, res, next) => {
   }
 
   try {
-    const queryVector = await embedText(question);
+    const standaloneQuestion = await rewriteQuery(ai, question, history);
+
+    const queryVector = await embedText(ai, standaloneQuestion);
     const searchResults = await getUserScopedIndex(userId).query({
       topK: 6,
       vector: queryVector,
@@ -185,7 +216,7 @@ Use only this PDF context to answer:
 ${context}
 
 User question:
-${question}
+${standaloneQuestion}
 
 Rules:
 - If the answer is not available in the context, say: "I don't have enough information in this PDF to answer that."
@@ -206,6 +237,7 @@ Answer:
 
     res.json({
       answer: response.text,
+      rewrittenQuestion: standaloneQuestion,
       sources: matches.map((match) => ({
         score: match.score,
         fileName: match.metadata?.fileName,
@@ -224,7 +256,7 @@ app.use((error, _req, res, _next) => {
   });
 });
 
-async function embedText(text) {
+async function embedText(ai, text) {
   const response = await ai.models.embedContent({
     model: embeddingModel,
     contents: text
@@ -234,6 +266,47 @@ async function embedText(text) {
     throw new Error('Embedding API returned an empty vector.');
   }
   return values;
+}
+
+async function rewriteQuery(ai, question, history) {
+  if (!Array.isArray(history) || history.length === 0) {
+    return question;
+  }
+
+  const recentHistory = history
+    .slice(-3)
+    .map((turn) => `User: ${turn.question}\nAssistant: ${turn.answer}`)
+    .join('\n\n');
+
+  const rewritePrompt = `
+Given this conversation history and a follow-up question, rewrite the follow-up
+question as a standalone question that includes full context. If the follow-up
+question is already standalone, return it unchanged. Return ONLY the rewritten
+question, with no extra text or explanation.
+
+Conversation history:
+${recentHistory}
+
+Follow-up question: ${question}
+
+Standalone question:
+`;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: chatModel,
+      contents: rewritePrompt,
+      config: {
+        temperature: 0
+      }
+    });
+
+    const rewritten = response.text?.trim();
+    return rewritten || question;
+  } catch (error) {
+    console.error('Query rewrite failed, falling back to original question:', error);
+    return question;
+  }
 }
 
 function splitText(text, { chunkSize, chunkOverlap }) {
